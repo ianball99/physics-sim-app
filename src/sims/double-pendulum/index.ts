@@ -2,12 +2,15 @@ import Matter from 'matter-js';
 import { Pane } from 'tweakpane';
 import type { MountedSim, SimDefinition } from '../types';
 
-const { Engine, Bodies, Composite, Constraint, Mouse, MouseConstraint, Runner, Body } = Matter;
+const { Engine, Bodies, Composite, Constraint, Events, Runner, Body } = Matter;
 
 const WIDTH = 640;
 const HEIGHT = 640;
 const ANCHOR = { x: WIDTH / 2, y: 70 };
 const TRAIL_LENGTH = 400;
+const DRAG_HISTORY_SIZE = 6;
+
+type DraggedBob = 'bob1' | 'bob2' | null;
 
 interface Params {
   length1: number;
@@ -76,14 +79,99 @@ function mount(container: HTMLElement): MountedSim {
 
   Composite.add(engine.world, [bob1, bob2, rod1, rod2]);
 
-  const mouse = Mouse.create(canvas);
-  const mouseConstraint = MouseConstraint.create(engine, {
-    mouse,
-    constraint: { stiffness: 0.2, render: { visible: false } },
-  });
-  Composite.add(engine.world, mouseConstraint);
-
   let trail: { x: number; y: number }[] = [];
+
+  // Dragging is kinematic rather than a Matter MouseConstraint spring: the
+  // grabbed bob is pinned to a point clamped onto its rod's fixed-length
+  // circle around its pivot (the anchor for bob1, or bob1 itself for bob2),
+  // every physics tick. That makes the rod length exactly correct for the
+  // whole drag instead of approximately correct via a spring fighting the
+  // rod constraint, which is what caused the visible stretch.
+  let draggedBob: DraggedBob = null;
+  let lastPointer = { x: 0, y: 0 };
+  let dragHistory: { x: number; y: number; t: number }[] = [];
+
+  function clampToRod(target: { x: number; y: number }, center: { x: number; y: number }, length: number) {
+    const dx = target.x - center.x;
+    const dy = target.y - center.y;
+    const dist = Math.hypot(dx, dy) || 1;
+    const scale = length / dist;
+    return { x: center.x + dx * scale, y: center.y + dy * scale };
+  }
+
+  function applyDragPosition() {
+    if (draggedBob === 'bob1') {
+      Body.setPosition(bob1, clampToRod(lastPointer, ANCHOR, params.length1));
+      Body.setVelocity(bob1, { x: 0, y: 0 });
+      Body.setAngularVelocity(bob1, 0);
+    } else if (draggedBob === 'bob2') {
+      Body.setPosition(bob2, clampToRod(lastPointer, bob1.position, params.length2));
+      Body.setVelocity(bob2, { x: 0, y: 0 });
+      Body.setAngularVelocity(bob2, 0);
+    }
+  }
+
+  Events.on(engine, 'beforeUpdate', applyDragPosition);
+
+  function getPointerPos(e: PointerEvent): { x: number; y: number } {
+    const rect = canvas.getBoundingClientRect();
+    return {
+      x: ((e.clientX - rect.left) / rect.width) * WIDTH,
+      y: ((e.clientY - rect.top) / rect.height) * HEIGHT,
+    };
+  }
+
+  function onPointerDown(e: PointerEvent) {
+    const p = getPointerPos(e);
+    const d1 = Math.hypot(p.x - bob1.position.x, p.y - bob1.position.y);
+    const d2 = Math.hypot(p.x - bob2.position.x, p.y - bob2.position.y);
+    const reach1 = (bob1.circleRadius ?? 10) * 2.5;
+    const reach2 = (bob2.circleRadius ?? 10) * 2.5;
+
+    if (d1 <= reach1 && d1 <= d2) {
+      draggedBob = 'bob1';
+    } else if (d2 <= reach2) {
+      draggedBob = 'bob2';
+    } else {
+      return;
+    }
+
+    canvas.setPointerCapture(e.pointerId);
+    lastPointer = p;
+    dragHistory = [{ ...p, t: performance.now() }];
+    applyDragPosition();
+  }
+
+  function onPointerMove(e: PointerEvent) {
+    if (!draggedBob) return;
+    lastPointer = getPointerPos(e);
+    dragHistory.push({ ...lastPointer, t: performance.now() });
+    if (dragHistory.length > DRAG_HISTORY_SIZE) dragHistory.shift();
+    applyDragPosition();
+  }
+
+  function onPointerUp() {
+    if (!draggedBob) return;
+    const body = draggedBob === 'bob1' ? bob1 : bob2;
+    const first = dragHistory[0];
+    const last = dragHistory[dragHistory.length - 1];
+    if (first && last) {
+      const dt = (last.t - first.t) / 1000;
+      if (dt > 0.001) {
+        Body.setVelocity(body, {
+          x: (last.x - first.x) / dt,
+          y: (last.y - first.y) / dt,
+        });
+      }
+    }
+    draggedBob = null;
+    dragHistory = [];
+  }
+
+  canvas.addEventListener('pointerdown', onPointerDown);
+  canvas.addEventListener('pointermove', onPointerMove);
+  canvas.addEventListener('pointerup', onPointerUp);
+  canvas.addEventListener('pointercancel', onPointerUp);
 
   function resetBodies() {
     Body.setPosition(bob1, { x: ANCHOR.x, y: ANCHOR.y + params.length1 });
@@ -96,6 +184,8 @@ function mount(container: HTMLElement): MountedSim {
     Body.setAngularVelocity(bob1, 0);
     Body.setAngularVelocity(bob2, 0);
     trail = [];
+    draggedBob = null;
+    dragHistory = [];
   }
 
   function applyMass(body: Matter.Body, mass: number) {
@@ -195,6 +285,11 @@ function mount(container: HTMLElement): MountedSim {
     destroy() {
       cancelAnimationFrame(frameId);
       Runner.stop(runner);
+      Events.off(engine, 'beforeUpdate', applyDragPosition);
+      canvas.removeEventListener('pointerdown', onPointerDown);
+      canvas.removeEventListener('pointermove', onPointerMove);
+      canvas.removeEventListener('pointerup', onPointerUp);
+      canvas.removeEventListener('pointercancel', onPointerUp);
       Composite.clear(engine.world, false);
       Engine.clear(engine);
       pane.dispose();
