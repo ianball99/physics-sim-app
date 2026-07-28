@@ -43,6 +43,11 @@ function mount(container: HTMLElement): MountedSim {
 
   const engine = Engine.create();
   engine.gravity.y = 1;
+  // Default constraintIterations (2) lets the rods stretch a little under
+  // fast, chaotic swings, which quietly bleeds energy and softens the
+  // sensitivity that makes a double pendulum chaotic. A stiffer solve keeps
+  // the rods closer to truly rigid.
+  engine.constraintIterations = 20;
 
   const bob1 = Bodies.circle(ANCHOR.x, ANCHOR.y + params.length1, radiusForMass(params.mass1), {
     frictionAir: params.damping,
