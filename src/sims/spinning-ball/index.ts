@@ -13,7 +13,8 @@ interface Params {
   restitutionFloor: number; // normal (vertical) bounce, off floor/ceiling
   restitutionWalls: number; // normal (horizontal) bounce, off left/right walls
   restitutionTangential: number; // e_t: tangential (horizontal) restitution at floor/ceiling, once friction has enough grip
-  friction: number; // Coulomb friction coefficient at floor/ceiling contact; also damps tangential speed on wall hits
+  restitutionTangentialWalls: number; // e_t for walls: tangential (vertical) restitution once friction has enough grip
+  friction: number; // Coulomb friction coefficient, shared by both floor/ceiling and wall contacts
   spin: number; // angular velocity (rad/s) applied to the ball the moment it's released from a drag
 }
 
@@ -21,6 +22,7 @@ const defaults: Params = {
   restitutionFloor: 0.8,
   restitutionWalls: 0.8,
   restitutionTangential: 0.5,
+  restitutionTangentialWalls: 0.5,
   friction: 0.4,
   spin: 0,
 };
@@ -55,25 +57,43 @@ function mount(container: HTMLElement): MountedSim {
     angle = 0;
   }
 
-  // Resolves a floor/ceiling bounce with coupled friction + spin, following the
-  // standard rigid-body contact-impulse model: friction (bounded by the Coulomb
+  // Shared rigid-body contact-impulse model: friction (bounded by the Coulomb
   // limit set by the normal impulse) tries to drive the contact-point slip
-  // toward -e_t * slip (e_t = 0 means the ball grips and ends up rolling; e_t > 0
-  // lets grip reverse some of the slip, like a superball's lively spin kick-back).
-  // normalSign is +1 for the floor (contact point below center) and -1 for the
-  // ceiling (contact point above center).
+  // toward -e_t * slip. e_t = 0 means the ball grips and ends up rolling;
+  // e_t > 0 lets grip reverse some of the slip, like a superball's lively
+  // spin kick-back; e_t < 0 models a "lossy" grip that retains more of the
+  // original slip direction than a pure roll would, down to e_t = -1 where
+  // it's equivalent to no coupling at all.
+  function tangentialImpulse(slip: number, jNormal: number, restitutionTangential: number): number {
+    const jMax = params.friction * jNormal;
+    const jStickTarget = (-slip * (1 + restitutionTangential) * MOMENT_COEFF) / (MOMENT_COEFF + 1);
+    return Math.abs(jStickTarget) <= jMax ? jStickTarget : -Math.sign(slip) * jMax;
+  }
+
+  // normalSign is +1 for the floor (contact point below center) and -1 for
+  // the ceiling (contact point above center).
   function resolveFloorCeilingBounce(vyIncoming: number, normalSign: 1 | -1) {
     vy = -vyIncoming * params.restitutionFloor;
 
     const slip = vx - normalSign * RADIUS * angularVelocity;
     const jNormal = (1 + params.restitutionFloor) * Math.abs(vyIncoming);
-    const jMax = params.friction * jNormal;
-    const jStickTarget = (-slip * (1 + params.restitutionTangential) * MOMENT_COEFF) / (MOMENT_COEFF + 1);
-
-    const j = Math.abs(jStickTarget) <= jMax ? jStickTarget : -Math.sign(slip) * jMax;
+    const j = tangentialImpulse(slip, jNormal, params.restitutionTangential);
 
     vx += j;
     angularVelocity -= (normalSign * j) / (MOMENT_COEFF * RADIUS);
+  }
+
+  // wallSign is +1 for the right wall (contact point right of center) and -1
+  // for the left wall (contact point left of center).
+  function resolveWallBounce(vxIncoming: number, wallSign: 1 | -1) {
+    vx = -vxIncoming * params.restitutionWalls;
+
+    const slip = vy + wallSign * RADIUS * angularVelocity;
+    const jNormal = (1 + params.restitutionWalls) * Math.abs(vxIncoming);
+    const j = tangentialImpulse(slip, jNormal, params.restitutionTangentialWalls);
+
+    vy += j;
+    angularVelocity += (wallSign * j) / (MOMENT_COEFF * RADIUS);
   }
 
   let dragging = false;
@@ -151,10 +171,16 @@ function mount(container: HTMLElement): MountedSim {
     label: 'Restitution (walls)',
   });
   pane.addBinding(params, 'restitutionTangential', {
-    min: 0,
+    min: -1,
     max: 1,
     step: 0.01,
     label: 'Restitution (horiz., floor/ceiling)',
+  });
+  pane.addBinding(params, 'restitutionTangentialWalls', {
+    min: -1,
+    max: 1,
+    step: 0.01,
+    label: 'Restitution (vert., walls)',
   });
   pane.addBinding(params, 'friction', {
     min: 0,
@@ -188,12 +214,10 @@ function mount(container: HTMLElement): MountedSim {
 
     if (x + RADIUS > WIDTH) {
       x = WIDTH - RADIUS;
-      vx = -vx * params.restitutionWalls;
-      vy *= 1 - params.friction;
+      resolveWallBounce(vx, 1);
     } else if (x - RADIUS < 0) {
       x = RADIUS;
-      vx = -vx * params.restitutionWalls;
-      vy *= 1 - params.friction;
+      resolveWallBounce(vx, -1);
     }
   }
 
