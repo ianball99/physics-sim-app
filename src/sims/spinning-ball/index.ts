@@ -14,7 +14,7 @@ interface Params {
   restitutionWalls: number; // normal (horizontal) bounce, off left/right walls
   restitutionTangential: number; // e_t: tangential (horizontal) restitution at floor/ceiling, once friction has enough grip
   friction: number; // Coulomb friction coefficient at floor/ceiling contact; also damps tangential speed on wall hits
-  spin: number; // control only: nudges the ball's current angular velocity (rad/s)
+  spin: number; // angular velocity (rad/s) applied to the ball the moment it's released from a drag
 }
 
 const defaults: Params = {
@@ -98,6 +98,7 @@ function mount(container: HTMLElement): MountedSim {
       y = clamp(p.y, RADIUS, HEIGHT - RADIUS);
       vx = 0;
       vy = 0;
+      angularVelocity = 0;
       dragHistory = [{ x, y, t: performance.now() }];
     }
   }
@@ -123,6 +124,7 @@ function mount(container: HTMLElement): MountedSim {
         vy = (last.y - first.y) / dt;
       }
     }
+    angularVelocity = params.spin;
     dragHistory = [];
   }
 
@@ -160,16 +162,12 @@ function mount(container: HTMLElement): MountedSim {
     step: 0.01,
     label: 'Surface friction',
   });
-  pane
-    .addBinding(params, 'spin', {
-      min: -25,
-      max: 25,
-      step: 0.5,
-      label: 'Give it spin',
-    })
-    .on('change', (ev) => {
-      angularVelocity = ev.value;
-    });
+  pane.addBinding(params, 'spin', {
+    min: -25,
+    max: 25,
+    step: 0.5,
+    label: 'Spin on release',
+  });
   pane.addButton({ title: 'Drop again' }).on('click', resetBall);
 
   function step(dt: number) {
