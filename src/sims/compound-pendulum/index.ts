@@ -67,6 +67,24 @@ function distanceToSegment(p: { x: number; y: number }, a: { x: number; y: numbe
   return Math.hypot(p.x - cx, p.y - cy);
 }
 
+// Matter.Body.scale operates in world-space X/Y axes, not the body's own
+// rotated axes -- scaling a tilted rectangle's height along world Y distorts
+// it into a skewed parallelogram instead of lengthening it along its own
+// axis. Rotating to angle 0 (where local and world axes coincide), scaling,
+// then rotating back preserves both the center and the true rod shape
+// regardless of the body's orientation at the time of the resize.
+function scaleRodLength(rod: Matter.Body, scaleY: number) {
+  const angle = rod.angle;
+  Body.setAngle(rod, 0);
+  Body.scale(rod, 1, scaleY);
+  Body.setAngle(rod, angle);
+}
+
+function settleVelocity(rod: Matter.Body) {
+  Body.setVelocity(rod, { x: 0, y: 0 });
+  Body.setAngularVelocity(rod, 0);
+}
+
 function mount(container: HTMLElement): MountedSim {
   const params: Params = { ...defaults };
 
@@ -242,29 +260,55 @@ function mount(container: HTMLElement): MountedSim {
   pane.addBinding(params, 'length1', { min: 50, max: 250, step: 1, label: 'Length 1' })
     .on('change', (ev) => {
       const newLength = ev.value;
-      Body.scale(rod1, 1, newLength / currentLength1);
+      scaleRodLength(rod1, newLength / currentLength1);
       Body.setMass(rod1, params.mass1);
-      pivot1.pointB = { x: 0, y: -newLength / 2 };
-      pivot2.pointA = { x: 0, y: newLength / 2 };
+
+      // Matter mutates constraint.pointA/pointB in place, incrementally
+      // rotating them each solve step to track their body's current angle.
+      // Assigning a freshly *computed* offset risks a rotation-convention
+      // mismatch with that internal tracking (verified the hard way -- an
+      // earlier version of this fix did exactly that and still desynced
+      // mid-swing). Rescaling the existing offset's magnitude by the length
+      // ratio instead preserves whatever direction Matter already has
+      // correctly tracked, so there's nothing to desync.
+      const ratio = newLength / currentLength1;
+      pivot1.pointB = { x: pivot1.pointB!.x * ratio, y: pivot1.pointB!.y * ratio };
+      pivot2.pointA = { x: pivot2.pointA!.x * ratio, y: pivot2.pointA!.y * ratio };
+
       currentLength1 = newLength;
       layoutRods();
+      settleVelocity(rod1);
+      settleVelocity(rod2);
     });
   pane.addBinding(params, 'length2', { min: 50, max: 250, step: 1, label: 'Length 2' })
     .on('change', (ev) => {
       const newLength = ev.value;
-      Body.scale(rod2, 1, newLength / currentLength2);
+      scaleRodLength(rod2, newLength / currentLength2);
       Body.setMass(rod2, params.mass2);
-      pivot2.pointB = { x: 0, y: -newLength / 2 };
+
+      const ratio = newLength / currentLength2;
+      pivot2.pointB = { x: pivot2.pointB!.x * ratio, y: pivot2.pointB!.y * ratio };
+
       currentLength2 = newLength;
       layoutRods();
+      settleVelocity(rod2);
     });
   pane.addBinding(params, 'mass1', { min: 1, max: 20, step: 0.5, label: 'Mass 1' })
     .on('change', (ev) => {
+      // Resizing keeps position continuous, but changing mass/inertia while
+      // velocity carries over unchanged injects unphysical kinetic energy --
+      // enough, with a large enough change mid-swing, to fling the pendulum
+      // wildly (verified: rod2's mass tripled mid-swing sent it flying off
+      // the visible canvas, still fully attached, just now way out of frame).
+      // Settling velocity on a mass edit avoids that surprise.
       Body.setMass(rod1, ev.value);
+      settleVelocity(rod1);
+      settleVelocity(rod2);
     });
   pane.addBinding(params, 'mass2', { min: 1, max: 20, step: 0.5, label: 'Mass 2' })
     .on('change', (ev) => {
       Body.setMass(rod2, ev.value);
+      settleVelocity(rod2);
     });
   pane.addBinding(params, 'damping', { min: 0, max: 0.05, step: 0.001, label: 'Damping' })
     .on('change', (ev) => {
