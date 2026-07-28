@@ -1,0 +1,22 @@
+{
+  "name": "physics-sim-app",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Interactive physics simulation playground with live parameter controls",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc && vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "matter-js": "^0.20.0",
+    "tweakpane": "^4.0.5"
+  },
+  "devDependencies": {
+    "@tweakpane/core": "^2.0.5",
+    "@types/matter-js": "^0.20.2",
+    "typescript": "^7.0.2",
+    "vite": "^8.1.5"
+  }
+}
