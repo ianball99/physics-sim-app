@@ -14,6 +14,7 @@ interface Params {
   length2: number;
   mass1: number;
   mass2: number;
+  damping: number;
   showTrail: boolean;
 }
 
@@ -22,6 +23,7 @@ const defaults: Params = {
   length2: 150,
   mass1: 5,
   mass2: 5,
+  damping: 0.01,
   showTrail: true,
 };
 
@@ -43,13 +45,13 @@ function mount(container: HTMLElement): MountedSim {
   engine.gravity.y = 1;
 
   const bob1 = Bodies.circle(ANCHOR.x, ANCHOR.y + params.length1, radiusForMass(params.mass1), {
-    frictionAir: 0,
+    frictionAir: params.damping,
   });
   const bob2 = Bodies.circle(
     ANCHOR.x,
     ANCHOR.y + params.length1 + params.length2,
     radiusForMass(params.mass2),
-    { frictionAir: 0 },
+    { frictionAir: params.damping },
   );
   Body.setMass(bob1, params.mass1);
   Body.setMass(bob2, params.mass2);
@@ -122,6 +124,11 @@ function mount(container: HTMLElement): MountedSim {
   pane.addBinding(params, 'mass2', { min: 1, max: 20, step: 0.5, label: 'Mass 2' })
     .on('change', (ev) => {
       applyMass(bob2, ev.value);
+    });
+  pane.addBinding(params, 'damping', { min: 0, max: 0.05, step: 0.001, label: 'Damping' })
+    .on('change', (ev) => {
+      bob1.frictionAir = ev.value;
+      bob2.frictionAir = ev.value;
     });
   pane.addBinding(params, 'showTrail', { label: 'Show trail' });
   pane.addButton({ title: 'Reset' }).on('click', resetBodies);
