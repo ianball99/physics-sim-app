@@ -25,7 +25,7 @@ const defaults: Params = {
   length2: 150,
   mass1: 5,
   mass2: 5,
-  damping: 0.05,
+  damping: 0,
   showTrail: true,
 };
 
