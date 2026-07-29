@@ -1,14 +1,13 @@
-import Matter from 'matter-js';
 import { Pane } from 'tweakpane';
 import type { MountedSim, SimDefinition } from '../types';
-
-const { Engine, Bodies, Composite, Constraint, Events, Runner, Body } = Matter;
 
 const WIDTH = 640;
 const HEIGHT = 640;
 const ANCHOR = { x: WIDTH / 2, y: 70 };
 const TRAIL_LENGTH = 400;
-const DRAG_HISTORY_SIZE = 6;
+const GRAVITY = 1200; // px/s^2, tuned so a ~150px pendulum has a natural-feeling period
+const FIXED_DT = 1 / 240; // physics substep -- see step() for why this is fixed
+const MAX_FRAME_DT = 1 / 20; // clamp a stalled/backgrounded tab's catch-up burst
 
 type DraggedBob = 'bob1' | 'bob2' | null;
 
@@ -26,12 +25,90 @@ const defaults: Params = {
   length2: 150,
   mass1: 5,
   mass2: 5,
-  damping: 0.01,
+  damping: 0.05,
   showTrail: true,
 };
 
+interface State {
+  theta1: number;
+  omega1: number;
+  theta2: number;
+  omega2: number;
+}
+
 function radiusForMass(mass: number): number {
   return Math.min(40, 8 + Math.sqrt(mass) * 6);
+}
+
+// Same convention used throughout the app: angle 0 hangs straight down
+// (screen y increases downward), positive angle rotates as seen on screen.
+function endpointOffset(angle: number, length: number): { x: number; y: number } {
+  return { x: -Math.sin(angle) * length, y: Math.cos(angle) * length };
+}
+
+function angleTowardTarget(pivot: { x: number; y: number }, target: { x: number; y: number }) {
+  const dx = target.x - pivot.x;
+  const dy = target.y - pivot.y;
+  return Math.atan2(-dx, dy);
+}
+
+// Shortest signed angular difference b - a, in (-pi, pi], so a drag crossing
+// the +-pi wraparound doesn't produce a finite-difference velocity spike.
+function angleDiff(b: number, a: number): number {
+  let d = (b - a) % (Math.PI * 2);
+  if (d > Math.PI) d -= Math.PI * 2;
+  if (d < -Math.PI) d += Math.PI * 2;
+  return d;
+}
+
+// Closed-form double pendulum equations of motion (standard Lagrangian
+// derivation; see e.g. Wikipedia's "Double pendulum" formal description).
+// Point masses m1, m2 on massless rods of length L1, L2. This is the exact
+// ODE, not an approximation from an iterative constraint solver -- there's
+// no "rod stiffness" to tune because there's no rod body, just the angles.
+function derivatives(s: State, m1: number, m2: number, L1: number, L2: number, damping: number): State {
+  const delta = s.theta1 - s.theta2;
+  const den = 2 * m1 + m2 - m2 * Math.cos(2 * delta);
+
+  const domega1 =
+    (-GRAVITY * (2 * m1 + m2) * Math.sin(s.theta1) -
+      m2 * GRAVITY * Math.sin(s.theta1 - 2 * s.theta2) -
+      2 * Math.sin(delta) * m2 * (s.omega2 * s.omega2 * L2 + s.omega1 * s.omega1 * L1 * Math.cos(delta))) /
+      (L1 * den) -
+    damping * s.omega1;
+
+  const domega2 =
+    (2 *
+      Math.sin(delta) *
+      (s.omega1 * s.omega1 * L1 * (m1 + m2) +
+        GRAVITY * (m1 + m2) * Math.cos(s.theta1) +
+        s.omega2 * s.omega2 * L2 * m2 * Math.cos(delta))) /
+      (L2 * den) -
+    damping * s.omega2;
+
+  return { theta1: s.omega1, omega1: domega1, theta2: s.omega2, omega2: domega2 };
+}
+
+function addScaled(s: State, d: State, h: number): State {
+  return {
+    theta1: s.theta1 + d.theta1 * h,
+    omega1: s.omega1 + d.omega1 * h,
+    theta2: s.theta2 + d.theta2 * h,
+    omega2: s.omega2 + d.omega2 * h,
+  };
+}
+
+function rk4Step(s: State, dt: number, m1: number, m2: number, L1: number, L2: number, damping: number): State {
+  const k1 = derivatives(s, m1, m2, L1, L2, damping);
+  const k2 = derivatives(addScaled(s, k1, dt / 2), m1, m2, L1, L2, damping);
+  const k3 = derivatives(addScaled(s, k2, dt / 2), m1, m2, L1, L2, damping);
+  const k4 = derivatives(addScaled(s, k3, dt), m1, m2, L1, L2, damping);
+  return {
+    theta1: s.theta1 + (dt / 6) * (k1.theta1 + 2 * k2.theta1 + 2 * k3.theta1 + k4.theta1),
+    omega1: s.omega1 + (dt / 6) * (k1.omega1 + 2 * k2.omega1 + 2 * k3.omega1 + k4.omega1),
+    theta2: s.theta2 + (dt / 6) * (k1.theta2 + 2 * k2.theta2 + 2 * k3.theta2 + k4.theta2),
+    omega2: s.omega2 + (dt / 6) * (k1.omega2 + 2 * k2.omega2 + 2 * k3.omega2 + k4.omega2),
+  };
 }
 
 function mount(container: HTMLElement): MountedSim {
@@ -44,74 +121,52 @@ function mount(container: HTMLElement): MountedSim {
 
   const ctx = canvas.getContext('2d')!;
 
-  const engine = Engine.create();
-  engine.gravity.y = 1;
-  // Default constraintIterations (2) lets the rods stretch a little under
-  // fast, chaotic swings, which quietly bleeds energy and softens the
-  // sensitivity that makes a double pendulum chaotic. A stiffer solve keeps
-  // the rods closer to truly rigid.
-  engine.constraintIterations = 20;
-
-  const bob1 = Bodies.circle(ANCHOR.x, ANCHOR.y + params.length1, radiusForMass(params.mass1), {
-    frictionAir: params.damping,
-  });
-  const bob2 = Bodies.circle(
-    ANCHOR.x,
-    ANCHOR.y + params.length1 + params.length2,
-    radiusForMass(params.mass2),
-    { frictionAir: params.damping },
-  );
-  Body.setMass(bob1, params.mass1);
-  Body.setMass(bob2, params.mass2);
-
-  const rod1 = Constraint.create({
-    pointA: { x: ANCHOR.x, y: ANCHOR.y },
-    bodyB: bob1,
-    length: params.length1,
-    stiffness: 1,
-  });
-  const rod2 = Constraint.create({
-    bodyA: bob1,
-    bodyB: bob2,
-    length: params.length2,
-    stiffness: 1,
-  });
-
-  Composite.add(engine.world, [bob1, bob2, rod1, rod2]);
-
+  let state: State = { theta1: 0, omega1: 0, theta2: 0, omega2: 0 };
   let trail: { x: number; y: number }[] = [];
 
-  // Dragging is kinematic rather than a Matter MouseConstraint spring: the
-  // grabbed bob is pinned to a point clamped onto its rod's fixed-length
-  // circle around its pivot (the anchor for bob1, or bob1 itself for bob2),
-  // every physics tick. That makes the rod length exactly correct for the
-  // whole drag instead of approximately correct via a spring fighting the
-  // rod constraint, which is what caused the visible stretch.
   let draggedBob: DraggedBob = null;
   let lastPointer = { x: 0, y: 0 };
-  let dragHistory: { x: number; y: number; t: number }[] = [];
 
-  function clampToRod(target: { x: number; y: number }, center: { x: number; y: number }, length: number) {
-    const dx = target.x - center.x;
-    const dy = target.y - center.y;
-    const dist = Math.hypot(dx, dy) || 1;
-    const scale = length / dist;
-    return { x: center.x + dx * scale, y: center.y + dy * scale };
+  function bob1Position() {
+    const o = endpointOffset(state.theta1, params.length1);
+    return { x: ANCHOR.x + o.x, y: ANCHOR.y + o.y };
   }
 
-  function applyDragPosition() {
+  function bob2Position(bob1: { x: number; y: number }) {
+    const o = endpointOffset(state.theta2, params.length2);
+    return { x: bob1.x + o.x, y: bob1.y + o.y };
+  }
+
+  // While a bob is held, its angle is driven directly from the pointer and
+  // its angular velocity is estimated by finite difference over the frame,
+  // then that (theta, omega) pair is fed into the *other* bob's genuine
+  // equation of motion -- the Lagrangian equation for one coordinate is
+  // valid for any trajectory of the other, prescribed or free, so the
+  // un-held bob reacts physically correctly to the one being dragged.
+  function applyDragForFrame(frameDt: number) {
     if (draggedBob === 'bob1') {
-      Body.setPosition(bob1, clampToRod(lastPointer, ANCHOR, params.length1));
-      Body.setVelocity(bob1, { x: 0, y: 0 });
-      Body.setAngularVelocity(bob1, 0);
+      const target = angleTowardTarget(ANCHOR, lastPointer);
+      state.omega1 = frameDt > 0 ? angleDiff(target, state.theta1) / frameDt : 0;
+      state.theta1 = target;
     } else if (draggedBob === 'bob2') {
-      Body.setPosition(bob2, clampToRod(lastPointer, bob1.position, params.length2));
-      Body.setVelocity(bob2, { x: 0, y: 0 });
-      Body.setAngularVelocity(bob2, 0);
+      const bob1 = bob1Position();
+      const target = angleTowardTarget(bob1, lastPointer);
+      state.omega2 = frameDt > 0 ? angleDiff(target, state.theta2) / frameDt : 0;
+      state.theta2 = target;
     }
   }
 
-  Events.on(engine, 'beforeUpdate', applyDragPosition);
+  function stepFree(dt: number) {
+    const next = rk4Step(state, dt, params.mass1, params.mass2, params.length1, params.length2, params.damping);
+    if (draggedBob === 'bob1') {
+      next.theta1 = state.theta1;
+      next.omega1 = state.omega1;
+    } else if (draggedBob === 'bob2') {
+      next.theta2 = state.theta2;
+      next.omega2 = state.omega2;
+    }
+    state = next;
+  }
 
   function getPointerPos(e: PointerEvent): { x: number; y: number } {
     const rect = canvas.getBoundingClientRect();
@@ -123,10 +178,12 @@ function mount(container: HTMLElement): MountedSim {
 
   function onPointerDown(e: PointerEvent) {
     const p = getPointerPos(e);
-    const d1 = Math.hypot(p.x - bob1.position.x, p.y - bob1.position.y);
-    const d2 = Math.hypot(p.x - bob2.position.x, p.y - bob2.position.y);
-    const reach1 = (bob1.circleRadius ?? 10) * 2.5;
-    const reach2 = (bob2.circleRadius ?? 10) * 2.5;
+    const b1 = bob1Position();
+    const b2 = bob2Position(b1);
+    const d1 = Math.hypot(p.x - b1.x, p.y - b1.y);
+    const d2 = Math.hypot(p.x - b2.x, p.y - b2.y);
+    const reach1 = radiusForMass(params.mass1) * 2.5;
+    const reach2 = radiusForMass(params.mass2) * 2.5;
 
     if (d1 <= reach1 && d1 <= d2) {
       draggedBob = 'bob1';
@@ -138,34 +195,17 @@ function mount(container: HTMLElement): MountedSim {
 
     canvas.setPointerCapture(e.pointerId);
     lastPointer = p;
-    dragHistory = [{ ...p, t: performance.now() }];
-    applyDragPosition();
   }
 
   function onPointerMove(e: PointerEvent) {
     if (!draggedBob) return;
     lastPointer = getPointerPos(e);
-    dragHistory.push({ ...lastPointer, t: performance.now() });
-    if (dragHistory.length > DRAG_HISTORY_SIZE) dragHistory.shift();
-    applyDragPosition();
   }
 
   function onPointerUp() {
-    if (!draggedBob) return;
-    const body = draggedBob === 'bob1' ? bob1 : bob2;
-    const first = dragHistory[0];
-    const last = dragHistory[dragHistory.length - 1];
-    if (first && last) {
-      const dt = (last.t - first.t) / 1000;
-      if (dt > 0.001) {
-        Body.setVelocity(body, {
-          x: (last.x - first.x) / dt,
-          y: (last.y - first.y) / dt,
-        });
-      }
-    }
+    // The drag's last finite-difference omega already carries over as the
+    // release "fling" velocity -- nothing extra to compute.
     draggedBob = null;
-    dragHistory = [];
   }
 
   canvas.addEventListener('pointerdown', onPointerDown);
@@ -173,29 +213,10 @@ function mount(container: HTMLElement): MountedSim {
   canvas.addEventListener('pointerup', onPointerUp);
   canvas.addEventListener('pointercancel', onPointerUp);
 
-  function resetBodies() {
-    Body.setPosition(bob1, { x: ANCHOR.x, y: ANCHOR.y + params.length1 });
-    Body.setPosition(bob2, {
-      x: ANCHOR.x,
-      y: ANCHOR.y + params.length1 + params.length2,
-    });
-    Body.setVelocity(bob1, { x: 0, y: 0 });
-    Body.setVelocity(bob2, { x: 0, y: 0 });
-    Body.setAngularVelocity(bob1, 0);
-    Body.setAngularVelocity(bob2, 0);
+  function resetState() {
+    state = { theta1: 0, omega1: 0, theta2: 0, omega2: 0 };
     trail = [];
     draggedBob = null;
-    dragHistory = [];
-  }
-
-  function applyMass(body: Matter.Body, mass: number) {
-    const newRadius = radiusForMass(mass);
-    const oldRadius = body.circleRadius ?? newRadius;
-    if (Math.abs(newRadius - oldRadius) > 0.01) {
-      const scale = newRadius / oldRadius;
-      Body.scale(body, scale, scale);
-    }
-    Body.setMass(body, mass);
   }
 
   const controlsHolder = document.createElement('div');
@@ -204,40 +225,35 @@ function mount(container: HTMLElement): MountedSim {
 
   const pane = new Pane({ title: 'Double Pendulum', container: controlsHolder });
 
-  pane.addBinding(params, 'length1', { min: 50, max: 250, step: 1, label: 'Length 1' })
-    .on('change', (ev) => {
-      rod1.length = ev.value;
-    });
-  pane.addBinding(params, 'length2', { min: 50, max: 250, step: 1, label: 'Length 2' })
-    .on('change', (ev) => {
-      rod2.length = ev.value;
-    });
-  pane.addBinding(params, 'mass1', { min: 1, max: 20, step: 0.5, label: 'Mass 1' })
-    .on('change', (ev) => {
-      applyMass(bob1, ev.value);
-    });
-  pane.addBinding(params, 'mass2', { min: 1, max: 20, step: 0.5, label: 'Mass 2' })
-    .on('change', (ev) => {
-      applyMass(bob2, ev.value);
-    });
-  pane.addBinding(params, 'damping', { min: 0, max: 0.05, step: 0.001, label: 'Damping' })
-    .on('change', (ev) => {
-      bob1.frictionAir = ev.value;
-      bob2.frictionAir = ev.value;
-    });
-  pane.addBinding(params, 'showTrail', { label: 'Show trail' });
-  pane.addButton({ title: 'Reset' }).on('click', resetBodies);
+  // Changing a parameter mid-swing changes the kinetic energy implied by the
+  // current angular velocities (e.g. KE scales with L^2*omega^2), which
+  // isn't a real physical process -- settling velocity to zero keeps a
+  // slider tweak from producing a surprise burst of motion.
+  function onParamChange() {
+    state.omega1 = 0;
+    state.omega2 = 0;
+  }
 
-  const runner = Runner.create();
-  Runner.run(runner, engine);
+  pane.addBinding(params, 'length1', { min: 50, max: 250, step: 1, label: 'Length 1' }).on('change', onParamChange);
+  pane.addBinding(params, 'length2', { min: 50, max: 250, step: 1, label: 'Length 2' }).on('change', onParamChange);
+  pane.addBinding(params, 'mass1', { min: 1, max: 20, step: 0.5, label: 'Mass 1' }).on('change', onParamChange);
+  pane.addBinding(params, 'mass2', { min: 1, max: 20, step: 0.5, label: 'Mass 2' }).on('change', onParamChange);
+  pane.addBinding(params, 'damping', { min: 0, max: 0.5, step: 0.01, label: 'Damping' });
+  pane.addBinding(params, 'showTrail', { label: 'Show trail' });
+  pane.addButton({ title: 'Reset' }).on('click', resetState);
 
   let frameId = 0;
+  let lastTime = performance.now();
+  let accumulator = 0;
 
   function draw() {
+    const b1 = bob1Position();
+    const b2 = bob2Position(b1);
+
     ctx.clearRect(0, 0, WIDTH, HEIGHT);
 
     if (params.showTrail) {
-      trail.push({ x: bob2.position.x, y: bob2.position.y });
+      trail.push(b2);
       if (trail.length > TRAIL_LENGTH) trail.shift();
 
       ctx.beginPath();
@@ -255,8 +271,8 @@ function mount(container: HTMLElement): MountedSim {
 
     ctx.beginPath();
     ctx.moveTo(ANCHOR.x, ANCHOR.y);
-    ctx.lineTo(bob1.position.x, bob1.position.y);
-    ctx.lineTo(bob2.position.x, bob2.position.y);
+    ctx.lineTo(b1.x, b1.y);
+    ctx.lineTo(b2.x, b2.y);
     ctx.strokeStyle = '#cfd3da';
     ctx.lineWidth = 3;
     ctx.stroke();
@@ -268,30 +284,53 @@ function mount(container: HTMLElement): MountedSim {
 
     ctx.fillStyle = '#3b6ef5';
     ctx.beginPath();
-    ctx.arc(bob1.position.x, bob1.position.y, bob1.circleRadius ?? 10, 0, Math.PI * 2);
+    ctx.arc(b1.x, b1.y, radiusForMass(params.mass1), 0, Math.PI * 2);
     ctx.fill();
 
     ctx.fillStyle = '#f5533b';
     ctx.beginPath();
-    ctx.arc(bob2.position.x, bob2.position.y, bob2.circleRadius ?? 10, 0, Math.PI * 2);
+    ctx.arc(b2.x, b2.y, radiusForMass(params.mass2), 0, Math.PI * 2);
     ctx.fill();
-
-    frameId = requestAnimationFrame(draw);
   }
 
-  frameId = requestAnimationFrame(draw);
+  function tick(now: number) {
+    const frameDt = Math.min(MAX_FRAME_DT, (now - lastTime) / 1000);
+    lastTime = now;
+
+    if (draggedBob) {
+      // A held bob is a real-time interactive gesture, not something that
+      // benefits from sub-frame precision -- update it once per rendered
+      // frame and let the free bob take one correspondingly larger RK4 step.
+      applyDragForFrame(frameDt);
+      stepFree(frameDt);
+      accumulator = 0;
+    } else {
+      // Free-swinging: step physics at a fixed rate decoupled from the
+      // display's refresh rate. A double pendulum is chaotic -- integrating
+      // with whatever variable dt the monitor happens to produce makes the
+      // exact trajectory refresh-rate dependent, which a fixed-timestep
+      // accumulator avoids, on top of just being more numerically accurate
+      // per step than one large RK4 step per frame.
+      accumulator += frameDt;
+      while (accumulator >= FIXED_DT) {
+        stepFree(FIXED_DT);
+        accumulator -= FIXED_DT;
+      }
+    }
+
+    draw();
+    frameId = requestAnimationFrame(tick);
+  }
+
+  frameId = requestAnimationFrame(tick);
 
   return {
     destroy() {
       cancelAnimationFrame(frameId);
-      Runner.stop(runner);
-      Events.off(engine, 'beforeUpdate', applyDragPosition);
       canvas.removeEventListener('pointerdown', onPointerDown);
       canvas.removeEventListener('pointermove', onPointerMove);
       canvas.removeEventListener('pointerup', onPointerUp);
       canvas.removeEventListener('pointercancel', onPointerUp);
-      Composite.clear(engine.world, false);
-      Engine.clear(engine);
       pane.dispose();
     },
   };
