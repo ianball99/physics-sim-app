@@ -16,6 +16,12 @@ const GRAB_PADDING = 16;
 // degrees of rotation per rendered frame while dragging, far more than any
 // real hand or finger gesture produces.
 const MAX_OMEGA = 50; // rad/s
+// Time constant for smoothing the drag's finite-difference omega estimate
+// before it's stored/fed to the other rod's equation of motion (see
+// applyDragForFrame) -- filters out per-frame pointer-sampling noise
+// without meaningfully delaying the response to real, sustained cursor
+// motion.
+const OMEGA_SMOOTHING_TAU = 0.05; // seconds
 
 type DraggedRod = 'rod1' | 'rod2' | null;
 
@@ -187,33 +193,48 @@ function mount(container: HTMLElement): MountedSim {
   // the target per frame keeps the good tracking everywhere except right
   // at the pivot, where it smoothly catches up instead of jittering.
   //
-  // rod1's pivot is the fixed anchor, so dragging it was always stable.
-  // rod2's pivot is rod1's *live* tip -- letting rod1 keep reacting
-  // physically to rod2's drag (as it originally did) created a feedback
-  // loop: dragging rod2 perturbs rod1, which moves rod2's own reference
-  // point, which shifts rod2's target angle, which perturbs rod1 further.
-  // The un-held rod is now frozen for the duration of any drag -- same as
-  // rod1's already-stationary anchor -- and resumes free motion, from
-  // wherever it was frozen, the moment you release.
+  // The un-held rod is free to react to the dragged one, same as before --
+  // that reaction is wanted (a real compound pendulum's other segment does
+  // follow along). What actually needs to be smooth is the *signal* that
+  // reaction is driven by: state.omega for the dragged rod is a
+  // finite-difference estimate from discrete pointer samples, which is
+  // inherently noisier than a real continuous velocity, and the coupled
+  // equation of motion squares it -- so raw per-frame noise in the drag's
+  // omega got amplified into a visibly jerky reaction in the other rod,
+  // which read as "elastic cord" even though theta itself (the dragged
+  // rod's own position) was already tracking smoothly. Exponentially
+  // smoothing omega toward each new raw sample, rather than snapping to
+  // it, removes that amplified noise while still responding to real,
+  // sustained cursor motion within about OMEGA_SMOOTHING_TAU.
   function applyDragForFrame(frameDt: number) {
     const maxStep = MAX_OMEGA * frameDt;
+    const smoothing = 1 - Math.exp(-frameDt / OMEGA_SMOOTHING_TAU);
 
     if (draggedRod === 'rod1') {
       const target = angleTowardTarget(ANCHOR, lastPointer);
       const dtheta = clamp(angleDiff(target, state.theta1), -maxStep, maxStep);
       state.theta1 += dtheta;
-      state.omega1 = frameDt > 0 ? dtheta / frameDt : 0;
+      const rawOmega = frameDt > 0 ? dtheta / frameDt : 0;
+      state.omega1 += (rawOmega - state.omega1) * smoothing;
     } else if (draggedRod === 'rod2') {
       const pivot = rod1Tip();
       const target = angleTowardTarget(pivot, lastPointer);
       const dtheta = clamp(angleDiff(target, state.theta2), -maxStep, maxStep);
       state.theta2 += dtheta;
-      state.omega2 = frameDt > 0 ? dtheta / frameDt : 0;
+      const rawOmega = frameDt > 0 ? dtheta / frameDt : 0;
+      state.omega2 += (rawOmega - state.omega2) * smoothing;
     }
   }
 
   function stepFree(dt: number) {
     const next = rk4Step(state, dt, params.mass1, params.mass2, params.length1, params.length2, params.damping);
+    if (draggedRod === 'rod1') {
+      next.theta1 = state.theta1;
+      next.omega1 = state.omega1;
+    } else if (draggedRod === 'rod2') {
+      next.theta2 = state.theta2;
+      next.omega2 = state.omega2;
+    }
     next.omega1 = clamp(next.omega1, -MAX_OMEGA, MAX_OMEGA);
     next.omega2 = clamp(next.omega2, -MAX_OMEGA, MAX_OMEGA);
     state = next;
@@ -350,9 +371,8 @@ function mount(container: HTMLElement): MountedSim {
     lastTime = now;
 
     if (draggedRod) {
-      // The un-held rod is frozen for the duration of the drag (see
-      // applyDragForFrame) -- no free step to take, just the drag update.
       applyDragForFrame(frameDt);
+      stepFree(frameDt);
       accumulator = 0;
     } else {
       accumulator += frameDt;

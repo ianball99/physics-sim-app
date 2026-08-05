@@ -14,6 +14,12 @@ const MAX_FRAME_DT = 1 / 20; // clamp a stalled/backgrounded tab's catch-up burs
 // degrees of rotation per rendered frame while dragging, far more than any
 // real hand or finger gesture produces.
 const MAX_OMEGA = 50; // rad/s
+// Time constant for smoothing the drag's finite-difference omega estimate
+// before it's stored/fed to the other bob's equation of motion (see
+// applyDragForFrame) -- filters out per-frame pointer-sampling noise
+// without meaningfully delaying the response to real, sustained cursor
+// motion.
+const OMEGA_SMOOTHING_TAU = 0.05; // seconds
 
 type DraggedBob = 'bob1' | 'bob2' | null;
 
@@ -165,34 +171,48 @@ function mount(container: HTMLElement): MountedSim {
   // smoothly catching up as the drag continues, rather than snapping
   // through the chaotic region or (as the tangent approach did) freezing.
   //
-  // bob1's pivot is the fixed anchor, so dragging it was always stable.
-  // bob2's pivot is bob1's *live* position -- letting bob1 keep reacting
-  // physically to bob2's drag (as it originally did) created a feedback
-  // loop: dragging bob2 perturbs bob1, which moves bob2's own reference
-  // point, which shifts bob2's target angle, which perturbs bob1 further.
-  // That loop is what read as "elastic cord" specifically on bob2. The
-  // un-held bob is now frozen for the duration of any drag -- same as
-  // bob1's already-stationary anchor -- and resumes free motion, from
-  // wherever it was frozen, the moment you release.
+  // The un-held bob is free to react to the dragged one, same as before --
+  // that reaction is wanted (a real double pendulum's other segment does
+  // follow along). What actually needs to be smooth is the *signal* that
+  // reaction is driven by: state.omega for the dragged bob is a
+  // finite-difference estimate from discrete pointer samples, which is
+  // inherently noisier than a real continuous velocity, and the coupled
+  // equation of motion squares it -- so raw per-frame noise in the drag's
+  // omega got amplified into a visibly jerky reaction in the other bob,
+  // which read as "elastic cord" even though theta itself (the dragged
+  // bob's own position) was already tracking smoothly. Exponentially
+  // smoothing omega toward each new raw sample, rather than snapping to
+  // it, removes that amplified noise while still responding to real,
+  // sustained cursor motion within about OMEGA_SMOOTHING_TAU.
   function applyDragForFrame(frameDt: number) {
     const maxStep = MAX_OMEGA * frameDt;
+    const smoothing = 1 - Math.exp(-frameDt / OMEGA_SMOOTHING_TAU);
 
     if (draggedBob === 'bob1') {
       const target = angleTowardTarget(ANCHOR, lastPointer);
       const dtheta = clamp(angleDiff(target, state.theta1), -maxStep, maxStep);
       state.theta1 += dtheta;
-      state.omega1 = frameDt > 0 ? dtheta / frameDt : 0;
+      const rawOmega = frameDt > 0 ? dtheta / frameDt : 0;
+      state.omega1 += (rawOmega - state.omega1) * smoothing;
     } else if (draggedBob === 'bob2') {
       const bob1 = bob1Position();
       const target = angleTowardTarget(bob1, lastPointer);
       const dtheta = clamp(angleDiff(target, state.theta2), -maxStep, maxStep);
       state.theta2 += dtheta;
-      state.omega2 = frameDt > 0 ? dtheta / frameDt : 0;
+      const rawOmega = frameDt > 0 ? dtheta / frameDt : 0;
+      state.omega2 += (rawOmega - state.omega2) * smoothing;
     }
   }
 
   function stepFree(dt: number) {
     const next = rk4Step(state, dt, params.mass1, params.mass2, params.length1, params.length2, params.damping);
+    if (draggedBob === 'bob1') {
+      next.theta1 = state.theta1;
+      next.omega1 = state.omega1;
+    } else if (draggedBob === 'bob2') {
+      next.theta2 = state.theta2;
+      next.omega2 = state.omega2;
+    }
     next.omega1 = clamp(next.omega1, -MAX_OMEGA, MAX_OMEGA);
     next.omega2 = clamp(next.omega2, -MAX_OMEGA, MAX_OMEGA);
     state = next;
@@ -335,9 +355,11 @@ function mount(container: HTMLElement): MountedSim {
     lastTime = now;
 
     if (draggedBob) {
-      // The un-held bob is frozen for the duration of the drag (see
-      // applyDragForFrame) -- no free step to take, just the drag update.
+      // A held bob is a real-time interactive gesture, not something that
+      // benefits from sub-frame precision -- update it once per rendered
+      // frame and let the free bob take one correspondingly larger RK4 step.
       applyDragForFrame(frameDt);
+      stepFree(frameDt);
       accumulator = 0;
     } else {
       // Free-swinging: step physics at a fixed rate decoupled from the
