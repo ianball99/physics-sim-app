@@ -335,6 +335,17 @@ function mount(container: HTMLElement): MountedSim {
     draggedRod = null;
   }
 
+  // Both rods collinear with the anchor, extended horizontally to the
+  // right (angle -pi/2 in this app's convention: endpointOffset(-pi/2, L)
+  // = (+L, 0)). Releasing from rest here is the classic maximal-chaos
+  // starting condition -- horizontal release converts the most possible
+  // potential energy into motion.
+  function resetToHorizontal() {
+    state = { theta1: -Math.PI / 2, omega1: 0, theta2: -Math.PI / 2, omega2: 0 };
+    trail = [];
+    draggedRod = null;
+  }
+
   const controlsHolder = document.createElement('div');
   controlsHolder.className = 'sim-controls';
   container.appendChild(controlsHolder);
@@ -353,6 +364,7 @@ function mount(container: HTMLElement): MountedSim {
   pane.addBinding(params, 'damping', { min: 0, max: 0.5, step: 0.01, label: 'Damping' });
   pane.addBinding(params, 'showTrail', { label: 'Show trail' });
   pane.addButton({ title: 'Reset' }).on('click', resetState);
+  pane.addButton({ title: 'Release Horizontal' }).on('click', resetToHorizontal);
 
   let frameId = 0;
   let lastTime = performance.now();
