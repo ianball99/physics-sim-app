@@ -147,21 +147,6 @@ function mount(container: HTMLElement): MountedSim {
     return { x: bob1.x + o.x, y: bob1.y + o.y };
   }
 
-  // Dragging by "angle from pivot to pointer" is singular at the pivot
-  // itself: as the cursor nears it, an infinitesimal cursor movement
-  // implies an enormous angular swing, which made a slow drag through that
-  // region feel erratic/uncontrollable (a fast flick just crosses it too
-  // quickly to notice). Instead, each frame projects the cursor's raw
-  // pixel movement onto the tangent direction at the bob's *current*
-  // angle and converts that to an angle step via arc length = radius *
-  // angle -- like turning a dial with your finger on its rim. This has no
-  // singularity anywhere, works the same close to or far from the pivot,
-  // and only depends on how far the cursor actually moved this frame.
-  //
-  // That (theta, omega) pair still feeds into the *other* bob's genuine
-  // equation of motion -- the Lagrangian equation for one coordinate is
-  // valid for any trajectory of the other, prescribed or free, so the
-  // un-held bob reacts physically correctly to the one being dragged.
   // "Point the bob at the cursor" (angle from pivot to pointer) gives the
   // most intuitive, responsive tracking almost everywhere -- but it's
   // singular at the pivot itself: as the cursor nears it, an
@@ -179,6 +164,16 @@ function mount(container: HTMLElement): MountedSim {
   // to the next, the actual angle only advances by the capped amount --
   // smoothly catching up as the drag continues, rather than snapping
   // through the chaotic region or (as the tangent approach did) freezing.
+  //
+  // bob1's pivot is the fixed anchor, so dragging it was always stable.
+  // bob2's pivot is bob1's *live* position -- letting bob1 keep reacting
+  // physically to bob2's drag (as it originally did) created a feedback
+  // loop: dragging bob2 perturbs bob1, which moves bob2's own reference
+  // point, which shifts bob2's target angle, which perturbs bob1 further.
+  // That loop is what read as "elastic cord" specifically on bob2. The
+  // un-held bob is now frozen for the duration of any drag -- same as
+  // bob1's already-stationary anchor -- and resumes free motion, from
+  // wherever it was frozen, the moment you release.
   function applyDragForFrame(frameDt: number) {
     const maxStep = MAX_OMEGA * frameDt;
 
@@ -198,13 +193,6 @@ function mount(container: HTMLElement): MountedSim {
 
   function stepFree(dt: number) {
     const next = rk4Step(state, dt, params.mass1, params.mass2, params.length1, params.length2, params.damping);
-    if (draggedBob === 'bob1') {
-      next.theta1 = state.theta1;
-      next.omega1 = state.omega1;
-    } else if (draggedBob === 'bob2') {
-      next.theta2 = state.theta2;
-      next.omega2 = state.omega2;
-    }
     next.omega1 = clamp(next.omega1, -MAX_OMEGA, MAX_OMEGA);
     next.omega2 = clamp(next.omega2, -MAX_OMEGA, MAX_OMEGA);
     state = next;
@@ -347,11 +335,9 @@ function mount(container: HTMLElement): MountedSim {
     lastTime = now;
 
     if (draggedBob) {
-      // A held bob is a real-time interactive gesture, not something that
-      // benefits from sub-frame precision -- update it once per rendered
-      // frame and let the free bob take one correspondingly larger RK4 step.
+      // The un-held bob is frozen for the duration of the drag (see
+      // applyDragForFrame) -- no free step to take, just the drag update.
       applyDragForFrame(frameDt);
-      stepFree(frameDt);
       accumulator = 0;
     } else {
       // Free-swinging: step physics at a fixed rate decoupled from the

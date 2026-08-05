@@ -179,14 +179,6 @@ function mount(container: HTMLElement): MountedSim {
     return { x: pivot.x + o.x, y: pivot.y + o.y };
   }
 
-  // Dragging by "angle from pivot to pointer" is singular at the pivot
-  // itself -- as the cursor nears it, an infinitesimal cursor movement
-  // implies an enormous angular swing, which made a slow drag through that
-  // region feel erratic (a fast flick just crosses it too quickly to
-  // notice). Instead, each frame projects the cursor's raw pixel movement
-  // onto the tangent direction at the rod's *current* angle and converts
-  // that to an angle step via arc length = radius * angle -- like turning
-  // a dial with your finger on its rim. No singularity anywhere.
   // "Point the rod at the cursor" is the most intuitive tracking almost
   // everywhere, but singular at the pivot -- see the identical note in the
   // point-mass double pendulum for why a tangent-projection approach was
@@ -194,6 +186,15 @@ function mount(container: HTMLElement): MountedSim {
   // rod's current direction). Rate-limiting how far theta can move toward
   // the target per frame keeps the good tracking everywhere except right
   // at the pivot, where it smoothly catches up instead of jittering.
+  //
+  // rod1's pivot is the fixed anchor, so dragging it was always stable.
+  // rod2's pivot is rod1's *live* tip -- letting rod1 keep reacting
+  // physically to rod2's drag (as it originally did) created a feedback
+  // loop: dragging rod2 perturbs rod1, which moves rod2's own reference
+  // point, which shifts rod2's target angle, which perturbs rod1 further.
+  // The un-held rod is now frozen for the duration of any drag -- same as
+  // rod1's already-stationary anchor -- and resumes free motion, from
+  // wherever it was frozen, the moment you release.
   function applyDragForFrame(frameDt: number) {
     const maxStep = MAX_OMEGA * frameDt;
 
@@ -213,13 +214,6 @@ function mount(container: HTMLElement): MountedSim {
 
   function stepFree(dt: number) {
     const next = rk4Step(state, dt, params.mass1, params.mass2, params.length1, params.length2, params.damping);
-    if (draggedRod === 'rod1') {
-      next.theta1 = state.theta1;
-      next.omega1 = state.omega1;
-    } else if (draggedRod === 'rod2') {
-      next.theta2 = state.theta2;
-      next.omega2 = state.omega2;
-    }
     next.omega1 = clamp(next.omega1, -MAX_OMEGA, MAX_OMEGA);
     next.omega2 = clamp(next.omega2, -MAX_OMEGA, MAX_OMEGA);
     state = next;
@@ -356,8 +350,9 @@ function mount(container: HTMLElement): MountedSim {
     lastTime = now;
 
     if (draggedRod) {
+      // The un-held rod is frozen for the duration of the drag (see
+      // applyDragForFrame) -- no free step to take, just the drag update.
       applyDragForFrame(frameDt);
-      stepFree(frameDt);
       accumulator = 0;
     } else {
       accumulator += frameDt;
