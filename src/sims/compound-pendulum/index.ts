@@ -10,14 +10,11 @@ const FIXED_DT = 1 / 240;
 const MAX_FRAME_DT = 1 / 20;
 const THICKNESS = 16;
 const GRAB_PADDING = 16;
-// Angle-to-a-point has a singularity at the point itself: as the drag
-// pointer passes near a rod's pivot, a tiny cursor movement implies a huge
-// angular swing, so the finite-difference omega estimate can spike toward
-// infinity right as the pointer crosses close to the pivot -- squared in
-// the coupled equation of motion, that overflows to Infinity/NaN and never
-// recovers. Clamping omega (both the drag estimate and, as a general
-// safety net, every free step) keeps that singularity from poisoning the
-// whole simulation.
+// Doubles as a rate limit on dragging (see applyDragForFrame) and a
+// general safety net after every free RK4 step. Normal swings, even
+// vigorous ones, stay well under this -- even at 60fps this allows ~48
+// degrees of rotation per rendered frame while dragging, far more than any
+// real hand or finger gesture produces.
 const MAX_OMEGA = 50; // rad/s
 
 type DraggedRod = 'rod1' | 'rod2' | null;
@@ -57,6 +54,8 @@ function angleTowardTarget(pivot: { x: number; y: number }, target: { x: number;
   return Math.atan2(-dx, dy);
 }
 
+// Shortest signed angular difference b - a, in (-pi, pi], so a drag crossing
+// the +-pi wraparound doesn't produce a spurious near-2pi delta.
 function angleDiff(b: number, a: number): number {
   let d = (b - a) % (Math.PI * 2);
   if (d > Math.PI) d -= Math.PI * 2;
@@ -180,18 +179,35 @@ function mount(container: HTMLElement): MountedSim {
     return { x: pivot.x + o.x, y: pivot.y + o.y };
   }
 
+  // Dragging by "angle from pivot to pointer" is singular at the pivot
+  // itself -- as the cursor nears it, an infinitesimal cursor movement
+  // implies an enormous angular swing, which made a slow drag through that
+  // region feel erratic (a fast flick just crosses it too quickly to
+  // notice). Instead, each frame projects the cursor's raw pixel movement
+  // onto the tangent direction at the rod's *current* angle and converts
+  // that to an angle step via arc length = radius * angle -- like turning
+  // a dial with your finger on its rim. No singularity anywhere.
+  // "Point the rod at the cursor" is the most intuitive tracking almost
+  // everywhere, but singular at the pivot -- see the identical note in the
+  // point-mass double pendulum for why a tangent-projection approach was
+  // tried and rejected (it goes numb on straight-line drags along the
+  // rod's current direction). Rate-limiting how far theta can move toward
+  // the target per frame keeps the good tracking everywhere except right
+  // at the pivot, where it smoothly catches up instead of jittering.
   function applyDragForFrame(frameDt: number) {
+    const maxStep = MAX_OMEGA * frameDt;
+
     if (draggedRod === 'rod1') {
       const target = angleTowardTarget(ANCHOR, lastPointer);
-      const omega = frameDt > 0 ? angleDiff(target, state.theta1) / frameDt : 0;
-      state.omega1 = clamp(omega, -MAX_OMEGA, MAX_OMEGA);
-      state.theta1 = target;
+      const dtheta = clamp(angleDiff(target, state.theta1), -maxStep, maxStep);
+      state.theta1 += dtheta;
+      state.omega1 = frameDt > 0 ? dtheta / frameDt : 0;
     } else if (draggedRod === 'rod2') {
       const pivot = rod1Tip();
       const target = angleTowardTarget(pivot, lastPointer);
-      const omega = frameDt > 0 ? angleDiff(target, state.theta2) / frameDt : 0;
-      state.omega2 = clamp(omega, -MAX_OMEGA, MAX_OMEGA);
-      state.theta2 = target;
+      const dtheta = clamp(angleDiff(target, state.theta2), -maxStep, maxStep);
+      state.theta2 += dtheta;
+      state.omega2 = frameDt > 0 ? dtheta / frameDt : 0;
     }
   }
 
@@ -228,8 +244,15 @@ function mount(container: HTMLElement): MountedSim {
 
     if (d1 <= reach && d1 <= d2) {
       draggedRod = 'rod1';
+      // One-time snap so the grab feels precise -- safe because it's a
+      // single assignment, not a continuous finite-difference through the
+      // pivot singularity.
+      state.theta1 = angleTowardTarget(ANCHOR, p);
+      state.omega1 = 0;
     } else if (d2 <= reach) {
       draggedRod = 'rod2';
+      state.theta2 = angleTowardTarget(tip1, p);
+      state.omega2 = 0;
     } else {
       return;
     }

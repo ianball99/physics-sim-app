@@ -8,15 +8,11 @@ const TRAIL_LENGTH = 400;
 const GRAVITY = 1200; // px/s^2, tuned so a ~150px pendulum has a natural-feeling period
 const FIXED_DT = 1 / 240; // physics substep -- see step() for why this is fixed
 const MAX_FRAME_DT = 1 / 20; // clamp a stalled/backgrounded tab's catch-up burst
-// Angle-to-a-point has a singularity at the point itself: as the drag
-// pointer passes near a bob's pivot, a tiny cursor movement implies a huge
-// angular swing, so the finite-difference omega estimate can spike toward
-// infinity right as the pointer crosses close to the pivot. Squared in the
-// coupled equation of motion, that overflows to Infinity/NaN and never
-// recovers. Clamping omega (both the drag estimate and, as a general
-// safety net, every free step) keeps that singularity from poisoning the
-// whole simulation -- normal swings, even vigorous ones, stay well under
-// this.
+// Doubles as a rate limit on dragging (see applyDragForFrame) and a
+// general safety net after every free RK4 step. Normal swings, even
+// vigorous ones, stay well under this -- even at 60fps this allows ~48
+// degrees of rotation per rendered frame while dragging, far more than any
+// real hand or finger gesture produces.
 const MAX_OMEGA = 50; // rad/s
 
 type DraggedBob = 'bob1' | 'bob2' | null;
@@ -63,7 +59,7 @@ function angleTowardTarget(pivot: { x: number; y: number }, target: { x: number;
 }
 
 // Shortest signed angular difference b - a, in (-pi, pi], so a drag crossing
-// the +-pi wraparound doesn't produce a finite-difference velocity spike.
+// the +-pi wraparound doesn't produce a spurious near-2pi delta.
 function angleDiff(b: number, a: number): number {
   let d = (b - a) % (Math.PI * 2);
   if (d > Math.PI) d -= Math.PI * 2;
@@ -151,24 +147,52 @@ function mount(container: HTMLElement): MountedSim {
     return { x: bob1.x + o.x, y: bob1.y + o.y };
   }
 
-  // While a bob is held, its angle is driven directly from the pointer and
-  // its angular velocity is estimated by finite difference over the frame,
-  // then that (theta, omega) pair is fed into the *other* bob's genuine
+  // Dragging by "angle from pivot to pointer" is singular at the pivot
+  // itself: as the cursor nears it, an infinitesimal cursor movement
+  // implies an enormous angular swing, which made a slow drag through that
+  // region feel erratic/uncontrollable (a fast flick just crosses it too
+  // quickly to notice). Instead, each frame projects the cursor's raw
+  // pixel movement onto the tangent direction at the bob's *current*
+  // angle and converts that to an angle step via arc length = radius *
+  // angle -- like turning a dial with your finger on its rim. This has no
+  // singularity anywhere, works the same close to or far from the pivot,
+  // and only depends on how far the cursor actually moved this frame.
+  //
+  // That (theta, omega) pair still feeds into the *other* bob's genuine
   // equation of motion -- the Lagrangian equation for one coordinate is
   // valid for any trajectory of the other, prescribed or free, so the
   // un-held bob reacts physically correctly to the one being dragged.
+  // "Point the bob at the cursor" (angle from pivot to pointer) gives the
+  // most intuitive, responsive tracking almost everywhere -- but it's
+  // singular at the pivot itself: as the cursor nears it, an
+  // infinitesimal cursor movement implies an enormous angular swing.
+  // (Tried a tangent-projection approach instead of this to sidestep the
+  // singularity entirely, but it goes the other way: a straight-line drag
+  // along the bob's current radius direction -- e.g. dragging bob2 straight
+  // up from its resting position -- has *zero* tangential component, so
+  // the bob doesn't move no matter how far you drag. Worse, not better.)
+  // The fix that keeps the good behavior everywhere else: rate-limit how
+  // much theta is allowed to move toward the target in one frame. Far from
+  // the pivot, real drag speeds never approach the limit, so it tracks the
+  // cursor with no perceptible difference from a direct snap. Near the
+  // pivot, where the target angle can swing wildly from one pointer sample
+  // to the next, the actual angle only advances by the capped amount --
+  // smoothly catching up as the drag continues, rather than snapping
+  // through the chaotic region or (as the tangent approach did) freezing.
   function applyDragForFrame(frameDt: number) {
+    const maxStep = MAX_OMEGA * frameDt;
+
     if (draggedBob === 'bob1') {
       const target = angleTowardTarget(ANCHOR, lastPointer);
-      const omega = frameDt > 0 ? angleDiff(target, state.theta1) / frameDt : 0;
-      state.omega1 = clamp(omega, -MAX_OMEGA, MAX_OMEGA);
-      state.theta1 = target;
+      const dtheta = clamp(angleDiff(target, state.theta1), -maxStep, maxStep);
+      state.theta1 += dtheta;
+      state.omega1 = frameDt > 0 ? dtheta / frameDt : 0;
     } else if (draggedBob === 'bob2') {
       const bob1 = bob1Position();
       const target = angleTowardTarget(bob1, lastPointer);
-      const omega = frameDt > 0 ? angleDiff(target, state.theta2) / frameDt : 0;
-      state.omega2 = clamp(omega, -MAX_OMEGA, MAX_OMEGA);
-      state.theta2 = target;
+      const dtheta = clamp(angleDiff(target, state.theta2), -maxStep, maxStep);
+      state.theta2 += dtheta;
+      state.omega2 = frameDt > 0 ? dtheta / frameDt : 0;
     }
   }
 
@@ -205,8 +229,15 @@ function mount(container: HTMLElement): MountedSim {
 
     if (d1 <= reach1 && d1 <= d2) {
       draggedBob = 'bob1';
+      // One-time snap so the grab feels precise -- safe because it's a
+      // single assignment, not a continuous finite-difference through the
+      // pivot singularity.
+      state.theta1 = angleTowardTarget(ANCHOR, p);
+      state.omega1 = 0;
     } else if (d2 <= reach2) {
       draggedBob = 'bob2';
+      state.theta2 = angleTowardTarget(b1, p);
+      state.omega2 = 0;
     } else {
       return;
     }
