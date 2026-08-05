@@ -8,6 +8,16 @@ const TRAIL_LENGTH = 400;
 const GRAVITY = 1200; // px/s^2, tuned so a ~150px pendulum has a natural-feeling period
 const FIXED_DT = 1 / 240; // physics substep -- see step() for why this is fixed
 const MAX_FRAME_DT = 1 / 20; // clamp a stalled/backgrounded tab's catch-up burst
+// Angle-to-a-point has a singularity at the point itself: as the drag
+// pointer passes near a bob's pivot, a tiny cursor movement implies a huge
+// angular swing, so the finite-difference omega estimate can spike toward
+// infinity right as the pointer crosses close to the pivot. Squared in the
+// coupled equation of motion, that overflows to Infinity/NaN and never
+// recovers. Clamping omega (both the drag estimate and, as a general
+// safety net, every free step) keeps that singularity from poisoning the
+// whole simulation -- normal swings, even vigorous ones, stay well under
+// this.
+const MAX_OMEGA = 50; // rad/s
 
 type DraggedBob = 'bob1' | 'bob2' | null;
 
@@ -59,6 +69,10 @@ function angleDiff(b: number, a: number): number {
   if (d > Math.PI) d -= Math.PI * 2;
   if (d < -Math.PI) d += Math.PI * 2;
   return d;
+}
+
+function clamp(value: number, min: number, max: number): number {
+  return Math.min(max, Math.max(min, value));
 }
 
 // Closed-form double pendulum equations of motion (standard Lagrangian
@@ -146,12 +160,14 @@ function mount(container: HTMLElement): MountedSim {
   function applyDragForFrame(frameDt: number) {
     if (draggedBob === 'bob1') {
       const target = angleTowardTarget(ANCHOR, lastPointer);
-      state.omega1 = frameDt > 0 ? angleDiff(target, state.theta1) / frameDt : 0;
+      const omega = frameDt > 0 ? angleDiff(target, state.theta1) / frameDt : 0;
+      state.omega1 = clamp(omega, -MAX_OMEGA, MAX_OMEGA);
       state.theta1 = target;
     } else if (draggedBob === 'bob2') {
       const bob1 = bob1Position();
       const target = angleTowardTarget(bob1, lastPointer);
-      state.omega2 = frameDt > 0 ? angleDiff(target, state.theta2) / frameDt : 0;
+      const omega = frameDt > 0 ? angleDiff(target, state.theta2) / frameDt : 0;
+      state.omega2 = clamp(omega, -MAX_OMEGA, MAX_OMEGA);
       state.theta2 = target;
     }
   }
@@ -165,6 +181,8 @@ function mount(container: HTMLElement): MountedSim {
       next.theta2 = state.theta2;
       next.omega2 = state.omega2;
     }
+    next.omega1 = clamp(next.omega1, -MAX_OMEGA, MAX_OMEGA);
+    next.omega2 = clamp(next.omega2, -MAX_OMEGA, MAX_OMEGA);
     state = next;
   }
 

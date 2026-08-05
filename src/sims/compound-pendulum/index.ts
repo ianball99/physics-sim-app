@@ -10,6 +10,15 @@ const FIXED_DT = 1 / 240;
 const MAX_FRAME_DT = 1 / 20;
 const THICKNESS = 16;
 const GRAB_PADDING = 16;
+// Angle-to-a-point has a singularity at the point itself: as the drag
+// pointer passes near a rod's pivot, a tiny cursor movement implies a huge
+// angular swing, so the finite-difference omega estimate can spike toward
+// infinity right as the pointer crosses close to the pivot -- squared in
+// the coupled equation of motion, that overflows to Infinity/NaN and never
+// recovers. Clamping omega (both the drag estimate and, as a general
+// safety net, every free step) keeps that singularity from poisoning the
+// whole simulation.
+const MAX_OMEGA = 50; // rad/s
 
 type DraggedRod = 'rod1' | 'rod2' | null;
 
@@ -53,6 +62,10 @@ function angleDiff(b: number, a: number): number {
   if (d > Math.PI) d -= Math.PI * 2;
   if (d < -Math.PI) d += Math.PI * 2;
   return d;
+}
+
+function clamp(value: number, min: number, max: number): number {
+  return Math.min(max, Math.max(min, value));
 }
 
 function distanceToSegment(p: { x: number; y: number }, a: { x: number; y: number }, b: { x: number; y: number }) {
@@ -170,12 +183,14 @@ function mount(container: HTMLElement): MountedSim {
   function applyDragForFrame(frameDt: number) {
     if (draggedRod === 'rod1') {
       const target = angleTowardTarget(ANCHOR, lastPointer);
-      state.omega1 = frameDt > 0 ? angleDiff(target, state.theta1) / frameDt : 0;
+      const omega = frameDt > 0 ? angleDiff(target, state.theta1) / frameDt : 0;
+      state.omega1 = clamp(omega, -MAX_OMEGA, MAX_OMEGA);
       state.theta1 = target;
     } else if (draggedRod === 'rod2') {
       const pivot = rod1Tip();
       const target = angleTowardTarget(pivot, lastPointer);
-      state.omega2 = frameDt > 0 ? angleDiff(target, state.theta2) / frameDt : 0;
+      const omega = frameDt > 0 ? angleDiff(target, state.theta2) / frameDt : 0;
+      state.omega2 = clamp(omega, -MAX_OMEGA, MAX_OMEGA);
       state.theta2 = target;
     }
   }
@@ -189,6 +204,8 @@ function mount(container: HTMLElement): MountedSim {
       next.theta2 = state.theta2;
       next.omega2 = state.omega2;
     }
+    next.omega1 = clamp(next.omega1, -MAX_OMEGA, MAX_OMEGA);
+    next.omega2 = clamp(next.omega2, -MAX_OMEGA, MAX_OMEGA);
     state = next;
   }
 
