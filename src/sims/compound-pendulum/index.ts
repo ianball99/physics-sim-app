@@ -22,6 +22,21 @@ const MAX_OMEGA = 50; // rad/s
 // without meaningfully delaying the response to real, sustained cursor
 // motion.
 const OMEGA_SMOOTHING_TAU = 0.05; // seconds
+// rod2's pivot is rod1's live tip, which reacts to rod2 being dragged --
+// unlike rod1's pivot (the fixed anchor), that reference point can move
+// out from under the drag. Two mitigations, both fading in as the cursor
+// nears the relevant pivot (a fraction of that rod's own length, so it
+// scales with the length sliders):
+//   1. The *targeting* pivot is a smoothed version of the live tip (rod2's
+//      actual attachment point stays exact -- only the "where should I
+//      aim" reference is filtered), so rod2's target angle isn't chasing
+//      rod1's own frame-to-frame jitter.
+//   2. How much of the dragged rod's omega is allowed to push the other
+//      rod's equation of motion is scaled down near the pivot -- grabbing
+//      right at a joint gives little leverage to impart torque through it,
+//      physically, and this stops the other rod from getting a strong,
+//      sustained push exactly when the drag signal is least reliable.
+const COUPLING_FADE_FRACTION = 0.3;
 
 type DraggedRod = 'rod1' | 'rod2' | null;
 
@@ -174,6 +189,8 @@ function mount(container: HTMLElement): MountedSim {
 
   let draggedRod: DraggedRod = null;
   let lastPointer = { x: 0, y: 0 };
+  let smoothedPivot = { x: 0, y: 0 }; // filtered rod1 tip, used only for rod2's targeting
+  let couplingTaper = 1; // 0..1, how much of the drag's omega reaches the other rod
 
   function rod1Tip() {
     const o = endpointOffset(state.theta1, params.length1);
@@ -216,18 +233,38 @@ function mount(container: HTMLElement): MountedSim {
       state.theta1 += dtheta;
       const rawOmega = frameDt > 0 ? dtheta / frameDt : 0;
       state.omega1 += (rawOmega - state.omega1) * smoothing;
+
+      const gripDist = Math.hypot(lastPointer.x - ANCHOR.x, lastPointer.y - ANCHOR.y);
+      couplingTaper = clamp(gripDist / (params.length1 * COUPLING_FADE_FRACTION), 0, 1);
     } else if (draggedRod === 'rod2') {
-      const pivot = rod1Tip();
-      const target = angleTowardTarget(pivot, lastPointer);
+      const livePivot = rod1Tip();
+      smoothedPivot.x += (livePivot.x - smoothedPivot.x) * smoothing;
+      smoothedPivot.y += (livePivot.y - smoothedPivot.y) * smoothing;
+
+      const target = angleTowardTarget(smoothedPivot, lastPointer);
       const dtheta = clamp(angleDiff(target, state.theta2), -maxStep, maxStep);
       state.theta2 += dtheta;
       const rawOmega = frameDt > 0 ? dtheta / frameDt : 0;
       state.omega2 += (rawOmega - state.omega2) * smoothing;
+
+      const gripDist = Math.hypot(lastPointer.x - livePivot.x, lastPointer.y - livePivot.y);
+      couplingTaper = clamp(gripDist / (params.length2 * COUPLING_FADE_FRACTION), 0, 1);
     }
   }
 
   function stepFree(dt: number) {
-    const next = rk4Step(state, dt, params.mass1, params.mass2, params.length1, params.length2, params.damping);
+    // The dragged rod's true omega always drives its own release velocity
+    // and is what state ends up holding -- only the *coupling* seen by the
+    // other rod's equation of motion is tapered, via a scaled-down copy
+    // fed into this one RK4 step.
+    const couplingState = draggedRod ? { ...state } : state;
+    if (draggedRod === 'rod1') {
+      couplingState.omega1 = state.omega1 * couplingTaper;
+    } else if (draggedRod === 'rod2') {
+      couplingState.omega2 = state.omega2 * couplingTaper;
+    }
+
+    const next = rk4Step(couplingState, dt, params.mass1, params.mass2, params.length1, params.length2, params.damping);
     if (draggedRod === 'rod1') {
       next.theta1 = state.theta1;
       next.omega1 = state.omega1;
@@ -268,10 +305,12 @@ function mount(container: HTMLElement): MountedSim {
       draggedRod = 'rod2';
       state.theta2 = angleTowardTarget(tip1, p);
       state.omega2 = 0;
+      smoothedPivot = { ...tip1 };
     } else {
       return;
     }
 
+    couplingTaper = 1;
     canvas.setPointerCapture(e.pointerId);
     lastPointer = p;
   }
